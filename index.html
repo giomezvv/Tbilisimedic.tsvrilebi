@@ -1018,6 +1018,7 @@
         firebase.initializeApp(firebaseConfig);
         auth = firebase.auth();
         db = firebase.firestore();
+                db.settings({ experimentalAutoDetectLongPolling: true });
 
         auth.onAuthStateChanged(user => {
             if (user) {
@@ -2915,7 +2916,8 @@ function downloadContractWord() {
     }
 
     function applyAuxData() {
-        if (DATA.length === 0 || Object.keys(AUX_DATA).length === 0) return;
+    if (DATA.length === 0) return;
+    if (Object.keys(AUX_DATA).length > 0) {
         DATA.forEach(p => {
             if (AUX_DATA[p.code]) { p.features = AUX_DATA[p.code].features; p.country = AUX_DATA[p.code].country; p.warranty = AUX_DATA[p.code].warranty;
             } else {
@@ -2923,9 +2925,10 @@ function downloadContractWord() {
                 if (AUX_DATA[numCode]) { p.features = AUX_DATA[numCode].features; p.country = AUX_DATA[numCode].country; p.warranty = AUX_DATA[numCode].warranty; }
             }
         });
-        renderCalc();
-        if (DATA.length > 0) updateUI();
     }
+    renderCalc();
+    updateUI();
+}
 
     const CONFIG = { "ენდოსკოპია": "f-endo", "ექოსკოპია": "f-echo", "ლაპარასკოპია": "f-lap", "ოფთალმოლოგია": "f-opht", "სხვა": "f-other", "-": "f-other" };
 
