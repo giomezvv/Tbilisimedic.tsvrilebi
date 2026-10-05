@@ -501,7 +501,6 @@
                 <span>📊 გაყიდვების მილსადენი (Pipeline)</span>
                 <input type="text" id="pipelineFilterAdmin" placeholder="🔍 ძიება: მეილით, კლინიკით, ინტერესით..." oninput="renderPipeline()" style="padding:5px 10px; border-radius:6px; border:1px solid var(--border); font-size:13px; width:280px;">
                 <input type="month" id="pipelineMonthFilter" onchange="renderPipeline()" style="padding:5px 10px; border-radius:6px; border:1px solid var(--border); font-size:13px; cursor:pointer;" title="მოგებული ლიდების ფილტრი თვის მიხედვით">
-                <button id="migrateFilesBtn" class="btn-calc" style="display:none; background:#0ea5e9; font-size:13px; padding:5px 12px;" onclick="runLeadFileMigration()">📦 ფაილების გადატანა Storage-ში</button>
             </div>
             
             <div style="display:flex; gap:10px;">
@@ -1040,7 +1039,6 @@
                     document.getElementById('pipelineFilterAdmin').style.display = 'block';
                     document.getElementById('taskFilterAdmin').style.display = 'block';
                 }
-                document.getElementById('migrateFilesBtn').style.display = isAdmin ? 'inline-block' : 'none';
 
                 fetchAppData();
                 fetchTarget();
@@ -2362,26 +2360,6 @@ function downloadContractWord() {
         console.table(report);
         console.log(report.length ? 'დასრულდა.' : 'გადასატანი ფაილები არ არის.');
         return report;
-    }
-
-    // ადმინის ღილაკი მილსადენში — იგივე გადატანა კონსოლის გარეშე, შედეგი ფანჯარაში
-    async function runLeadFileMigration() {
-        const btn = document.getElementById('migrateFilesBtn');
-        if (!confirm("ლიდებში ჩაშენებული ფაილები გადავა Storage-ში. ლიდების სხვა მონაცემები არ შეიცვლება.\n\nგავაგრძელოთ?")) return;
-        btn.disabled = true;
-        btn.innerText = '⏳ მიმდინარეობს...';
-        try {
-            const report = await migrateLeadFilesToStorage() || [];
-            const ok = report.filter(r => r.result === 'OK').length;
-            alert(report.length
-                ? `დასრულდა: ${ok} / ${report.length} ლიდი წარმატებით.\n\n` + report.map(r => `${r.result === 'OK' ? '✅' : '❌'} ${r.lead || r.id}: ${r.files}${r.result === 'OK' ? '' : '\n   ' + r.result}`).join('\n')
-                : 'გადასატანი ფაილები აღარ არის — ყველა ფაილი უკვე Storage-შია.');
-        } catch (err) {
-            alert("შეცდომა: " + (err && err.message ? err.message : err));
-        } finally {
-            btn.disabled = false;
-            btn.innerText = '📦 ფაილების გადატანა Storage-ში';
-        }
     }
 
     function openLeadModal(leadId = null) {
