@@ -18,6 +18,10 @@ const firebaseConfig = {
 // იგივე სია უნდა იყოს firestore.rules-სა და storage.rules-ში, წინააღმდეგ შემთხვევაში დაცვა არ მუშაობს.
 const ADMIN_EMAILS = ["gio.mezvv@gmail.com"];
 
+// ლიდის შემქმნელი ლიდს ხედავს და არედაქტირებს მაშინაც, როცა მფლობელი სხვაა (მაგ. ადმინს გადასცა).
+// ⚠️ true მოითხოვს firestore.rules-სა და storage.rules-ში createdByMe()-ს — სხვაგვარად შემქმნელის დაფა შეცდომას აჩვენებს.
+const CREATOR_KEEPS_LEAD_ACCESS = true;
+
 const STORAGE_BASE_URL = "https://firebasestorage.googleapis.com/v0/b/stockpipeline-2c77b.firebasestorage.app/o/products%2F";
 const storageUrl = fileName => `${STORAGE_BASE_URL}${encodeURIComponent(fileName)}?alt=media`;
 const COMPANY_LOGO_URL = storageUrl("mediclogo.png");

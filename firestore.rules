@@ -32,12 +32,23 @@ service cloud.firestore {
       allow write: if isAdmin();
     }
 
-    // Leads and tasks: admins see everything; managers only their own.
-    // Managers may hand their own lead to another user (and then lose access to it); tasks cannot be reassigned.
+    // The lead's creator (userId, set once on create) keeps read/edit access after handing the lead to
+    // someone else. Matches CREATOR_KEEPS_LEAD_ACCESS = true in js/config.js.
+    function createdByMe() {
+      return signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // Non-admins can never change who created a lead.
+    function keepsCreator() {
+      return request.resource.data.get('userId', null) == resource.data.get('userId', null);
+    }
+
+    // Leads and tasks: admins see everything; managers their own, plus leads they created.
+    // Managers may hand a lead they own or created to another user; tasks cannot be reassigned.
     match /leads/{leadId} {
-      allow read: if isAdmin() || ownsExisting();
-      allow create: if isAdmin() || ownsNew();
-      allow update: if isAdmin() || ownsExisting();
+      allow read: if isAdmin() || ownsExisting() || createdByMe();
+      allow create: if isAdmin() || (ownsNew() && request.resource.data.userId == request.auth.uid);
+      allow update: if isAdmin() || ((ownsExisting() || createdByMe()) && keepsCreator());
       allow delete: if isAdmin();
     }
 

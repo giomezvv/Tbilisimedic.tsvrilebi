@@ -33,24 +33,36 @@ function loadLeadsFromFirebase() {
 
     if (unsubscribeLeads) unsubscribeLeads();
 
-    let query = db.collection("leads");
+    // ადმინი ყველა ლიდს ხედავს; სხვები — საკუთარს და (CREATOR_KEEPS_LEAD_ACCESS-ისას) მათ მიერ შექმნილს.
+    // Firestore-ის წესები თითოეულ მოთხოვნას ცალკე ამოწმებს, ამიტომ ორი ცალკე მოთხოვნაა და შედეგები ერთიანდება.
+    const leads = db.collection("leads");
+    const queries = isAdmin ? [leads]
+        : CREATOR_KEEPS_LEAD_ACCESS
+            ? [leads.where("userEmail", "==", currentUser.email), leads.where("userId", "==", currentUser.uid)]
+            : [leads.where("userEmail", "==", currentUser.email)];
 
-    if (!isAdmin) {
-        query = query.where("userEmail", "==", currentUser.email);
-    }
-
-    unsubscribeLeads = query.onSnapshot((querySnapshot) => {
-        leadsData = [];
-        querySnapshot.forEach((doc) => {
-            leadsData.push({ id: doc.id, ...doc.data() });
-        });
+    const results = queries.map(() => new Map());
+    const publish = () => {
+        const merged = new Map();
+        results.forEach(r => r.forEach((lead, id) => merged.set(id, lead)));
+        leadsData = [...merged.values()];
         updateUsersDatalist();
         renderPipeline();
+    };
+    const unsubscribers = queries.map((query, i) => query.onSnapshot((querySnapshot) => {
+        results[i] = new Map(querySnapshot.docs.map(doc => [doc.id, { id: doc.id, ...doc.data() }]));
+        publish();
     }, (error) => {
         console.error("ლიდების ჩატვირთვის შეცდომა:", error);
-        leadsData = [];
-        renderPipeline();
-    });
+        results[i] = new Map();
+        publish();
+    }));
+    unsubscribeLeads = () => unsubscribers.forEach(u => u());
+}
+
+// ლიდი სხვას ეკუთვნის — ბარათსა და ფანჯარაში ვაჩვენებთ, ვისთანაა (ადმინს ყოველთვის)
+function showLeadOwner(lead) {
+    return isAdmin || !!(lead.userEmail && currentUser && lead.userEmail !== currentUser.email);
 }
 
 function updateLeadSelectors() {
@@ -118,7 +130,7 @@ function renderPipeline() {
 
                         return `
                         <div class="${cardClass}" draggable="true" ondragstart="dragLead(event, ${jsArg(l.id)})" onclick="openLeadModal(${jsArg(l.id)})">
-                            ${isAdmin ? `<div style="font-size:10.5px; color:#3b82f6; margin-bottom:6px; font-weight:600;">👤 ${escapeHtml(l.userEmail || 'უცნობი')}</div>` : ''}
+                            ${showLeadOwner(l) ? `<div style="font-size:10.5px; color:#3b82f6; margin-bottom:6px; font-weight:600;">👤 ${escapeHtml(l.userEmail || 'უცნობი')}</div>` : ''}
                             ${l.product ? `<div class="lead-interest">🎯 ${escapeHtml(l.product)}</div>` : ''}
                             <div class="lead-title">${escapeHtml(l.clinic || 'უცნობი კლინიკა')}</div>
                             <div class="lead-clinic">👤 ${escapeHtml(l.contact || '-')}</div>
@@ -307,9 +319,9 @@ function openLeadModal(leadId = null) {
         document.getElementById('leadFollowUp').value = currentEditingLead.followUpDate || '';
 
         const authorEl = document.getElementById('leadAuthorDisplay');
-        if (isAdmin && currentEditingLead.userEmail) {
+        if (showLeadOwner(currentEditingLead)) {
             authorEl.style.display = 'block';
-            authorEl.innerText = 'დაამატა: ' + currentEditingLead.userEmail;
+            authorEl.innerText = (isAdmin ? 'დაამატა: ' : 'პასუხისმგებელი: ') + currentEditingLead.userEmail;
         } else {
             authorEl.style.display = 'none';
         }
@@ -526,15 +538,22 @@ async function saveLead() {
         alert("პასუხისმგებელი მენეჯერის ელ-ფოსტა არასწორია.");
         return;
     }
+    // ამჟამინდელი მფლობელი (ახალი ლიდისთვის — თავად მომხმარებელი); ცარიელი ველი მფლობელს არ ცვლის
+    const prevOwner = (id && currentEditingLead && currentEditingLead.userEmail) || myEmail;
     if (customEmail) data.userEmail = customEmail;
-    else if (!id || !isAdmin) data.userEmail = myEmail;
+    else if (!id) data.userEmail = myEmail;
+    else if (!isAdmin) data.userEmail = prevOwner;
 
-    // არაადმინი ლიდს სხვას გადასცემს: ჯერ საკუთარი სახელით ვინახავთ (ფაილების ატვირთვა/წაშლა Storage-ის წესებით
-    // მფლობელს მოითხოვს) და მფლობელს ბოლოს ვცვლით — ამის შემდეგ ლიდი მის დაფაზე აღარ ჩანს
-    const transferTo = (!isAdmin && !isLocalMode && data.userEmail !== myEmail) ? data.userEmail : null;
+    // არაადმინი ლიდს სხვას გადასცემს: ჯერ ძველი მფლობელით ვინახავთ (ფაილების ატვირთვა/წაშლა Storage-ის წესებით
+    // წვდომას მოითხოვს) და მფლობელს ბოლოს ვცვლით
+    const transferTo = (!isAdmin && !isLocalMode && data.userEmail !== prevOwner) ? data.userEmail : null;
     if (transferTo) {
-        if (!confirm(`ლიდი გადაეცემა: ${transferTo}\n\nშენახვის შემდეგ ის თქვენს დაფაზე აღარ გამოჩნდება. გავაგრძელოთ?`)) return;
-        data.userEmail = myEmail;
+        const isCreator = !id || !!(currentEditingLead && currentUser && currentEditingLead.userId === currentUser.uid);
+        const after = CREATOR_KEEPS_LEAD_ACCESS && isCreator
+            ? 'ლიდი თქვენს დაფაზეც დარჩება (თქვენ შექმენით) და მისი რედაქტირება კვლავ შეგეძლებათ.'
+            : 'შენახვის შემდეგ ის თქვენს დაფაზე აღარ გამოჩნდება.';
+        if (!confirm(`ლიდი გადაეცემა: ${transferTo}\n\n${after} გავაგრძელოთ?`)) return;
+        data.userEmail = prevOwner;
     }
 
     if (id) {

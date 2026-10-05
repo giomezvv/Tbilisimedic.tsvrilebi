@@ -24,6 +24,13 @@ service firebase.storage {
           == request.auth.token.email;
     }
 
+    // Lead files: the owner, or the lead's creator (matches firestore.rules createdByMe()).
+    function canAccessLead(leadId) {
+      let lead = firestore.get(/databases/(default)/documents/leads/$(leadId)).data;
+      return signedIn() &&
+        (lead.userEmail == request.auth.token.email || lead.get('userId', null) == request.auth.uid);
+    }
+
     function validUpload() {
       return request.resource.size < 10 * 1024 * 1024;
     }
@@ -36,8 +43,8 @@ service firebase.storage {
 
     // Lead attachments. Files are immutable: replacing one means delete + create.
     match /leads/{leadId}/{fileName} {
-      allow read, delete: if isAdmin() || ownsDoc('leads', leadId);
-      allow create: if (isAdmin() || ownsDoc('leads', leadId)) && validUpload();
+      allow read, delete: if isAdmin() || canAccessLead(leadId);
+      allow create: if (isAdmin() || canAccessLead(leadId)) && validUpload();
       allow update: if false;
     }
 
