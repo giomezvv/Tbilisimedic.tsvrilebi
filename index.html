@@ -10,6 +10,7 @@
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-storage-compat.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
     <style>
@@ -942,7 +943,7 @@
 };
 
     let isLocalMode = firebaseConfig.apiKey === "YOUR_API_KEY";
-    let db, auth, currentUser = null;
+    let db, auth, storage, currentUser = null;
     let localLeads = JSON.parse(localStorage.getItem('stock_pipeline_leads')) || [];
     let localTasks = JSON.parse(localStorage.getItem('stock_pipeline_tasks')) || [];
     const ADMIN_EMAILS = ["gio.mezvv@gmail.com"]; 
@@ -1018,6 +1019,7 @@
         firebase.initializeApp(firebaseConfig);
         auth = firebase.auth();
         db = firebase.firestore();
+        storage = firebase.storage();
                 db.settings({ experimentalAutoDetectLongPolling: true });
 
         auth.onAuthStateChanged(user => {
@@ -2269,12 +2271,103 @@ function downloadContractWord() {
        ========================================== */
     let currentEditingLead = null;
     let tempFiles = [];
+    let removedLeadPaths = []; // Storage-იდან წასაშლელი ფაილები — იშლება მხოლოდ ლიდის შენახვის შემდეგ
+    let leadSaving = false;
+
+    /* ლიდის ფაილები ინახება Firebase Storage-ში (leads/{leadId}/...), ლიდში კი მხოლოდ { name, path, amount }.
+       ძველ ლიდებში ფაილი შეიძლება ჯერ კიდევ ჩაშენებული იყოს { name, data } სახით — ორივე ფორმატი მუშაობს.
+       ახალი, ჯერ აუტვირთავი ფაილი: { name, blob, amount, pending: true } (ბაზაში არ იწერება). */
+    const MAX_LEAD_FILE_SIZE = 10 * 1024 * 1024;
+
+    function uploadLeadFile(leadId, name, blob) {
+        const safe = String(name || 'file').replace(/[\/\\#?\[\]*\x00-\x1f]/g, '_').slice(0, 150);
+        const path = `leads/${leadId}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}_${safe}`;
+        const contentType = blob.type || 'application/octet-stream';
+        return storage.ref(path)
+            .put(blob, { contentType, contentDisposition: `attachment; filename*=UTF-8''${encodeURIComponent(name)}` })
+            .then(() => ({ name, path }));
+    }
+
+    // ატვირთავს მოლოდინში მყოფ ფაილებს და აბრუნებს ბაზაში ჩასაწერ სიას (ძველი/უკვე ატვირთული ჩანაწერები უცვლელია)
+    async function uploadPendingLeadFiles(leadId, files) {
+        const result = [];
+        for (const f of files) {
+            if (!f.pending) { result.push(f); continue; }
+            const stored = await uploadLeadFile(leadId, f.name, f.blob);
+            result.push({ ...stored, amount: f.amount || 0 });
+        }
+        return result;
+    }
+
+    function deleteLeadFiles(paths) {
+        paths.forEach(p => storage.ref(p).delete().catch(err => console.warn('Storage-იდან წაშლა ვერ მოხერხდა:', p, err)));
+    }
+
+    // გადმოწერის ბმული მოთხოვნისას იქმნება, რომ Storage-ის წესებმა წვდომა ყოველ ჯერზე შეამოწმოს
+    function openLeadFile(event, index) {
+        event.preventDefault();
+        const f = tempFiles[index];
+        if (!f || !f.path) return;
+        storage.ref(f.path).getDownloadURL().then(url => {
+            const a = document.createElement('a');
+            a.href = url;
+            a.rel = 'noopener';
+            a.click();
+        }).catch(err => alert("ფაილის გახსნა ვერ მოხერხდა: " + (err && err.message ? err.message : err)));
+    }
+
+    // ინვოისის/შეთავაზების/შეკვეთის HTML-ის მიმაგრება ლიდზე: ფაილი Storage-ში, ლიდში მხოლოდ ბმული
+    async function attachHtmlToLead(lead, name, html, amount, historyText) {
+        const stored = await uploadLeadFile(lead.id, name, new Blob([html], { type: 'text/html;charset=utf-8' }));
+        if (!lead.files) lead.files = [];
+        lead.files.push({ ...stored, amount });
+        lead.amount = (parseFloat(lead.amount) || 0) + amount;
+        if (!lead.history) lead.history = [];
+        lead.history.push({
+            date: new Date().toLocaleDateString('ka-GE') + " " + new Date().getHours() + ":" + new Date().getMinutes(),
+            text: historyText,
+            author: currentUser ? currentUser.email : "სისტემა"
+        });
+        await db.collection("leads").doc(lead.id).update({ files: lead.files, amount: lead.amount, history: lead.history });
+    }
+
+    // ერთჯერადი გადატანა: ლიდებში ჩაშენებული ფაილები → Storage. გაუშვით ადმინმა კონსოლიდან: migrateLeadFilesToStorage()
+    async function migrateLeadFilesToStorage() {
+        if (!isAdmin) { console.error('ჯერ შედით ადმინის ანგარიშით'); return; }
+        const report = [];
+        for (const lead of leadsData) {
+            const old = (lead.files && lead.files.length) ? lead.files
+                : (lead.fileName && lead.fileData ? [{ name: lead.fileName, data: lead.fileData, amount: 0 }] : []);
+            const todo = old.filter(f => !f.path && typeof f.data === 'string' && f.data.startsWith('data:'));
+            if (!todo.length) continue;
+            const uploaded = [];
+            try {
+                const files = [];
+                for (const f of old) {
+                    if (!todo.includes(f)) { files.push(f); continue; }
+                    const blob = await (await fetch(f.data)).blob();
+                    const stored = await uploadLeadFile(lead.id, f.name || 'file', blob);
+                    uploaded.push(stored.path);
+                    files.push({ ...stored, amount: f.amount || 0 });
+                }
+                await db.collection("leads").doc(lead.id).update({ files, fileName: null, fileData: null });
+                report.push({ lead: lead.clinic, id: lead.id, files: todo.map(f => f.name).join(', '), result: 'OK' });
+            } catch (err) {
+                deleteLeadFiles(uploaded);
+                report.push({ lead: lead.clinic, id: lead.id, files: todo.map(f => f.name).join(', '), result: 'FAILED (ლიდი არ შეცვლილა): ' + (err.message || err) });
+            }
+        }
+        console.table(report);
+        console.log(report.length ? 'დასრულდა.' : 'გადასატანი ფაილები არ არის.');
+        return report;
+    }
 
     function openLeadModal(leadId = null) {
         document.getElementById('leadModal').style.display = 'flex';
         document.getElementById('leadNote').value = '';
         document.getElementById('leadFileUpload').value = '';
         tempFiles = [];
+        removedLeadPaths = [];
         
         if (isAdmin) {
             document.getElementById('leadManagerSection').style.display = 'block';
@@ -2333,14 +2426,12 @@ function downloadContractWord() {
 
     function handleLeadFileUpload(event) {
         const file = event.target.files[0];
+        document.getElementById('leadFileUpload').value = '';
         if(!file) return;
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            tempFiles.push({ name: file.name, data: e.target.result, amount: 0 });
-            renderLeadFiles(tempFiles);
-            document.getElementById('leadFileUpload').value = '';
-        };
-        reader.readAsDataURL(file);
+        if (file.size > MAX_LEAD_FILE_SIZE) { alert("ფაილი ძალიან დიდია (მაქს. 10 MB)."); return; }
+        // ფაილი Storage-ში აიტვირთება ლიდის შენახვისას
+        tempFiles.push({ name: file.name, blob: file, amount: 0, pending: true });
+        renderLeadFiles(tempFiles);
     }
 
     function renderLeadFiles(files) {
@@ -2351,7 +2442,11 @@ function downloadContractWord() {
         }
         box.innerHTML = files.map((f, i) => `
             <div style="display:inline-flex; align-items:center; gap:8px; background:#e2f0eb; padding:6px 10px; border-radius:6px; border:1px solid #a7d8c6;">
-                <a href="${f.data}" download="${f.name}" style="color:var(--primary); font-size:12px; text-decoration:none; font-weight:600;">📎 ${f.name}</a>
+                ${f.path
+                    ? `<a href="#" onclick="openLeadFile(event, ${i})" style="color:var(--primary); font-size:12px; text-decoration:none; font-weight:600;">📎 ${f.name}</a>`
+                    : f.pending
+                    ? `<span style="color:#64748b; font-size:12px; font-weight:600;" title="აიტვირთება შენახვისას">⏳ ${f.name}</span>`
+                    : `<a href="${f.data}" download="${f.name}" style="color:var(--primary); font-size:12px; text-decoration:none; font-weight:600;">📎 ${f.name}</a>`}
                 <span style="cursor:pointer; color:#ef4444; font-size:14px; font-weight:bold;" onclick="removeTempFile(${i})" title="ფაილის წაშლა">✕</span>
             </div>
         `).join('');
@@ -2364,6 +2459,7 @@ function downloadContractWord() {
             currentAmt = currentAmt - removedFile.amount;
             document.getElementById('leadAmount').value = Math.max(0, currentAmt).toFixed(2);
         }
+        if (removedFile && removedFile.path) removedLeadPaths.push(removedFile.path);
         tempFiles.splice(index, 1);
         renderLeadFiles(tempFiles);
     }
@@ -2417,7 +2513,8 @@ function downloadContractWord() {
         }
     }
 
-    function saveLead() {
+    async function saveLead() {
+        if (leadSaving) return;
         const id = document.getElementById('leadId').value;
         const data = {
             clinic: document.getElementById('leadClinic').value,
@@ -2447,7 +2544,18 @@ function downloadContractWord() {
                 localStorage.setItem('stock_pipeline_leads', JSON.stringify(localLeads));
                 closeLeadModal(); renderPipeline();
             } else {
-                db.collection("leads").doc(id).update(data).then(() => closeLeadModal());
+                leadSaving = true;
+                try {
+                    data.files = await uploadPendingLeadFiles(id, tempFiles);
+                    await db.collection("leads").doc(id).update(data);
+                    deleteLeadFiles(removedLeadPaths);
+                    closeLeadModal();
+                } catch (err) {
+                    console.error("შენახვის შეცდომა:", err);
+                    alert("შენახვა ვერ მოხერხდა: " + (err && err.message ? err.message : err));
+                } finally {
+                    leadSaving = false;
+                }
             }
         } else {
             data.userId = currentUser ? currentUser.uid : "local_user_1";
@@ -2460,7 +2568,23 @@ function downloadContractWord() {
                 localStorage.setItem('stock_pipeline_leads', JSON.stringify(localLeads));
                 closeLeadModal(); renderPipeline();
             } else {
-                db.collection("leads").add(data).then(() => closeLeadModal());
+                // ლიდი ჯერ ფაილების გარეშე იქმნება (Storage-ის წესები ატვირთვისას ლიდის მფლობელს ამოწმებს), შემდეგ ემატება ფაილები
+                leadSaving = true;
+                const ref = db.collection("leads").doc();
+                try {
+                    await ref.set({ ...data, files: tempFiles.filter(f => !f.pending) });
+                    document.getElementById('leadId').value = ref.id; // განმეორებითი შენახვა დუბლიკატს არ შექმნის
+                    currentEditingLead = { ...data, id: ref.id };
+                    if (tempFiles.some(f => f.pending)) {
+                        await ref.update({ files: await uploadPendingLeadFiles(ref.id, tempFiles) });
+                    }
+                    closeLeadModal();
+                } catch (err) {
+                    console.error("შენახვის შეცდომა:", err);
+                    alert("შენახვა ვერ მოხერხდა: " + (err && err.message ? err.message : err) + "\n\nსცადეთ ხელახლა შენახვა.");
+                } finally {
+                    leadSaving = false;
+                }
             }
         }
     }
@@ -2480,25 +2604,11 @@ function downloadContractWord() {
 
         const lead = leadsData.find(l => l.id === leadId);
         if(lead) {
-            lead.amount = (parseFloat(lead.amount) || 0) + totalVal;
-            
-            if(!lead.files) lead.files = [];
-            
-            lead.files.push({
-                name: `ინვოისი_${new Date().toISOString().slice(0,10)}_${Date.now()}.html`,
-                data: "data:text/html;charset=utf-8," + encodeURIComponent(document.getElementById('invoicePrintArea').innerHTML),
-                amount: totalVal 
-            });
-            
-            if(!lead.history) lead.history = [];
-            lead.history.push({
-                date: new Date().toLocaleDateString('ka-GE') + " " + new Date().getHours() + ":" + new Date().getMinutes(),
-                text: `მიმაგრდა ახალი ინვოისი (თანხა დაემატა: ${totalVal} ₾)`,
-                author: currentUser ? currentUser.email : "სისტემა"
-            });
-            updateLeadInDB(leadId, lead);
-            alert("ინვოისი წარმატებით მიმაგრდა არჩეულ ლიდს და თანხა დაჯამდა!");
-            closeInvoice();
+            attachHtmlToLead(lead, `ინვოისი_${new Date().toISOString().slice(0,10)}_${Date.now()}.html`,
+                document.getElementById('invoicePrintArea').innerHTML, totalVal,
+                `მიმაგრდა ახალი ინვოისი (თანხა დაემატა: ${totalVal} ₾)`)
+                .then(() => { alert("ინვოისი წარმატებით მიმაგრდა არჩეულ ლიდს და თანხა დაჯამდა!"); closeInvoice(); })
+                .catch(err => alert("მიმაგრება ვერ მოხერხდა: " + (err && err.message ? err.message : err)));
         }
     }
 
@@ -2512,25 +2622,11 @@ function downloadContractWord() {
 
         const lead = leadsData.find(l => l.id === leadId);
         if(lead) {
-            lead.amount = (parseFloat(lead.amount) || 0) + totalVal;
-            
-            if(!lead.files) lead.files = [];
-
-            lead.files.push({
-                name: `შეთავაზება_${new Date().toISOString().slice(0,10)}_${Date.now()}.html`,
-                data: "data:text/html;charset=utf-8," + encodeURIComponent(document.getElementById('offerPrintArea').innerHTML),
-                amount: totalVal
-            });
-            
-            if(!lead.history) lead.history = [];
-            lead.history.push({
-                date: new Date().toLocaleDateString('ka-GE') + " " + new Date().getHours() + ":" + new Date().getMinutes(),
-                text: `მიმაგრდა ახალი შეთავაზება (თანხა დაემატა: ${totalVal} ₾)`,
-                author: currentUser ? currentUser.email : "სისტემა"
-            });
-            updateLeadInDB(leadId, lead);
-            alert("შეთავაზება წარმატებით მიმაგრდა არჩეულ ლიდს და თანხა დაჯამდა!");
-            closeOfferModal();
+            attachHtmlToLead(lead, `შეთავაზება_${new Date().toISOString().slice(0,10)}_${Date.now()}.html`,
+                document.getElementById('offerPrintArea').innerHTML, totalVal,
+                `მიმაგრდა ახალი შეთავაზება (თანხა დაემატა: ${totalVal} ₾)`)
+                .then(() => { alert("შეთავაზება წარმატებით მიმაგრდა არჩეულ ლიდს და თანხა დაჯამდა!"); closeOfferModal(); })
+                .catch(err => alert("მიმაგრება ვერ მოხერხდა: " + (err && err.message ? err.message : err)));
         }
     }
 
@@ -2541,22 +2637,10 @@ function downloadContractWord() {
         
         const lead = leadsData.find(l => l.id === leadId);
         if(lead) {
-            if(!lead.files) lead.files = [];
-            lead.files.push({
-                name: `შეკვეთა_${new Date().toISOString().slice(0,10)}_${Date.now()}.html`,
-                data: "data:text/html;charset=utf-8," + encodeURIComponent(document.getElementById('orderPrintArea').innerHTML),
-                amount: 0 
-            });
-            
-            if(!lead.history) lead.history = [];
-            lead.history.push({
-                date: new Date().toLocaleDateString('ka-GE') + " " + new Date().getHours() + ":" + new Date().getMinutes(),
-                text: `მიმაგრდა ახალი შეკვეთა`,
-                author: currentUser ? currentUser.email : "სისტემა"
-            });
-            updateLeadInDB(leadId, lead);
-            alert("შეკვეთა წარმატებით მიმაგრდა არჩეულ მოგებულ ლიდს!");
-            closeOrderModal();
+            attachHtmlToLead(lead, `შეკვეთა_${new Date().toISOString().slice(0,10)}_${Date.now()}.html`,
+                document.getElementById('orderPrintArea').innerHTML, 0, `მიმაგრდა ახალი შეკვეთა`)
+                .then(() => { alert("შეკვეთა წარმატებით მიმაგრდა არჩეულ მოგებულ ლიდს!"); closeOrderModal(); })
+                .catch(err => alert("მიმაგრება ვერ მოხერხდა: " + (err && err.message ? err.message : err)));
         }
     }
 
