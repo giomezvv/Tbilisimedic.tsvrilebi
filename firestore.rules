@@ -1,0 +1,55 @@
+rules_version = '2';
+
+// Server-side access control for the app. The ADMIN_EMAILS list in js/config.js only
+// hides UI — without these rules any signed-in user can read/write everything via the SDK.
+// Deploy:  firebase deploy --only firestore:rules   (or paste into Firebase Console → Firestore → Rules)
+// Keep the admin list below in sync with ADMIN_EMAILS in js/config.js and storage.rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.email in [
+        'gio.mezvv@gmail.com'
+      ];
+    }
+
+    function ownsExisting() {
+      return signedIn() && resource.data.userEmail == request.auth.token.email;
+    }
+
+    function ownsNew() {
+      return signedIn() && request.resource.data.userEmail == request.auth.token.email;
+    }
+
+    // Stock, clients, features, sales history, targets, settings:
+    // everyone signed in reads, only admins write.
+    match /appData/{docId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // Leads and tasks: admins see everything; managers only their own.
+    // Managers may hand their own lead to another user (and then lose access to it); tasks cannot be reassigned.
+    match /leads/{leadId} {
+      allow read: if isAdmin() || ownsExisting();
+      allow create: if isAdmin() || ownsNew();
+      allow update: if isAdmin() || ownsExisting();
+      allow delete: if isAdmin();
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isAdmin() || ownsExisting();
+      allow create: if isAdmin() || ownsNew();
+      allow update: if isAdmin() || (ownsExisting() && ownsNew());
+      allow delete: if isAdmin();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,54 @@
+rules_version = '2';
+
+// Server-side access control for Firebase Storage.
+// Deploy:  firebase deploy --only storage   (or paste into Firebase Console → Storage → Rules)
+// Keep the admin list below in sync with ADMIN_EMAILS in js/config.js and firestore.rules.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn() && request.auth.token.email in [
+        'gio.mezvv@gmail.com'
+      ];
+    }
+
+    // Ownership is read from the Firestore document, so it matches firestore.rules
+    // and follows the lead/task when it is reassigned.
+    function ownsDoc(collection, docId) {
+      return signedIn() &&
+        firestore.get(/databases/(default)/documents/$(collection)/$(docId)).data.userEmail
+          == request.auth.token.email;
+    }
+
+    function validUpload() {
+      return request.resource.size < 10 * 1024 * 1024;
+    }
+
+    // Product images, logo and stamp: loaded publicly via ?alt=media URLs, only admins change them.
+    match /products/{allPaths=**} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    // Lead attachments. Files are immutable: replacing one means delete + create.
+    match /leads/{leadId}/{fileName} {
+      allow read, delete: if isAdmin() || ownsDoc('leads', leadId);
+      allow create: if (isAdmin() || ownsDoc('leads', leadId)) && validUpload();
+      allow update: if false;
+    }
+
+    match /tasks/{taskId}/{fileName} {
+      allow read, delete: if isAdmin() || ownsDoc('tasks', taskId);
+      allow create: if (isAdmin() || ownsDoc('tasks', taskId)) && validUpload();
+      allow update: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
